@@ -7,7 +7,7 @@ from collections import namedtuple as _nt
 
 # increment when changing these core tables 
 # (consider changing API level as well)
-SCHEMAVERSION = 2
+SCHEMAVERSION = 3
 
 # names of the operational tables
 ENUMTBLNAME = '_enum_'
@@ -37,7 +37,8 @@ _reserved_ =  tbl('_reserved_', 'state keeping for reopening database',(
                   col('pkey_', 'name to use for pkey columns', 'TEXT'),
                   col('schemaversion', 'version number of database schema', 'INTEGER NOT NULL'),
                   col('apiversion', 'version number of DADB API', 'INTEGER NOT NULL'),
-                  col('prefix_', 'prefix used in all table and field names' , 'TEXT')),
+                  col('prefix_', 'prefix used in all table and field names' , 'TEXT'),
+                  col('timeline_blacklist', 'list of modelnames to exclude from timeline', 'TEXT')),
                   None)
 
 
@@ -152,7 +153,29 @@ def enum_tabledef(prefix, tblname):
               'UNIQUE ({:s}, {:s})'.format(_val, _name))
 
 
-def create_timeline_view(db):
+def timeline_fields(db, excluded=None):
+    ''' determine which fields to include in timeline '''
+
+    # select the fields with a Datetime or Date type
+    # (expand to list to prevent issues with nested queries)
+    dtfields = list(db.select('_fieldinfo_', where={'datatype_':'Datetime'},
+                    cursor=db.dbcur))
+    dfields = list(db.select('_fieldinfo_', where={'datatype_':'Date'},
+                   cursor=db.dbcur))
+
+    if excluded is not None:
+        if isinstance(excluded, list):
+            for mname in excluded:
+                if mname not in db.models:
+                    raise ValueError('timeline exclusion list contains invalid modelname')
+            dtfields = [f for f in dtfields if f.modelname_ not in excluded]
+            dfields = [f for f in dfields if f.modelname_ not in excluded]
+        else:
+            raise ValueError('expected list of modelnames to exclude from timeline')
+    return dtfields + dfields
+
+
+def create_timeline_view(db, excluded=None):
     ''' creates a timeline view in the given DADB database '''
 
     # make sure it is all done, or nothing at all
@@ -167,6 +190,16 @@ def create_timeline_view(db):
                     cursor=db.dbcur))
     dfields = list(db.select('_fieldinfo_', where={'datatype_':'Date'},
                    cursor=db.dbcur))
+
+    if excluded is not None:
+        if isinstance(excluded, list):
+            for mname in excluded:
+                if mname not in db.models:
+                    raise ValueError('timeline exclusion list contains invalid modelname')
+            dtfields = [f for f in dtfields if f.modelname_ not in excluded]
+            dfields = [f for f in dfields if f.modelname_ not in excluded]
+        else:
+            raise ValueError('expected list of modelnames to exclude from timeline')
 
     # create the model part of the query
     subdt = [_modeltimeline_subquery(db, fd) for fd in dtfields]
@@ -209,13 +242,15 @@ def _modeltimeline_subquery(db, fd):
     # and columns that should be hidden from previews
     columns = filter(lambda c: bool(getattr(c, 'preview_')) is True, columns)
     # and place the columnnames in a list
-    colnames = [getattr(cc, 'columnname_') for cc in columns]
+    colnames = [(getattr(cc, 'fieldname_'), getattr(cc, 'columnname_')) for cc in columns]
 
-    # add CAST to String
-    colnames = ["'{:s}:' || COALESCE(CAST({:s} AS TEXT),'')\n".format(c,c) for c in colnames]
-
-    # create the preview query
-    preview = " || '|' || ".join(colnames)
+    if len(colnames) == 0:
+        preview = "''"
+    else:
+        # add CAST to String
+        colnames = ["'{:s}:' || COALESCE(CAST({:s} AS TEXT),'')\n".format(c[0],c[1]) for c in colnames]
+        # create the preview query
+        preview = " || '|' || ".join(colnames)
 
     query = q.format(getattr(fd, 'columnname_'),
                      getattr(fd, 'columnname_'),

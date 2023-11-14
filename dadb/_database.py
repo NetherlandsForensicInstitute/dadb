@@ -12,6 +12,7 @@ from enum import Enum as _Enum
 from datetime import datetime as _datetime
 import apsw as _apsw
 from copy import deepcopy as _deepcopy
+from ast import literal_eval as _literal_eval
 
 # package imports
 from ._schema import _reserved_
@@ -22,6 +23,7 @@ from ._schema import MAPTBLNAME, PROPTBLNAME, SCHEMAVERSION
 from ._schema import enum_tabledef as _enum_tabledef
 from ._schema import create_timeline_view as _create_timeline_view
 from ._schema import create_fieldinfo_view as _create_fieldinfo_view
+from ._schema import timeline_fields as _timeline_fields
 from ._schema import validname as _validname
 
 from ._model_definition import field_definition as _field_definition
@@ -96,6 +98,9 @@ class Database:
         #  at least once in the active process, in order to make sure
         #  that the writer has the proper version of the model)
         s._writing_allowed = set()
+
+        # keep track of models that are excluded from the timeline view
+        s._excluded_from_timeline = []
 
 
     def __del__(s):
@@ -220,7 +225,8 @@ class Database:
         # create the reserved table
         s._register_table(_reserved_, create=True)
         resrec = s.tables[_reserved_.name].record
-        resrec = resrec(s.pkey, SCHEMAVERSION, APIVERSION, s.prefix)
+        tl_blacklist = repr(s._excluded_from_timeline)
+        resrec = resrec(s.pkey, SCHEMAVERSION, APIVERSION, s.prefix, tl_blacklist)
         rowid = s._insert_record(_reserved_.name, resrec, cursor=s.dbcur)
 
         # register and create the operational and data tables
@@ -231,7 +237,7 @@ class Database:
 
         # create static views
         _create_fieldinfo_view(s)
-        _create_timeline_view(s)
+        _create_timeline_view(s, s._excluded_from_timeline)
 
         # end transaction again
         s.dbcur.execute('COMMIT')
@@ -273,6 +279,9 @@ class Database:
         if api != APIVERSION:
             msg = 'db API version {:d} != DADB API version {:d}'.format(api, APIVERSION)
             raise _exceptions.VersionError(msg)
+
+        timeline_blacklist = _literal_eval(getattr(res, 'timeline_blacklist'))
+        s._excluded_from_timeline = [l.strip() for l in timeline_blacklist]
 
         # load the in memory representation of the operational and data tables
         tbldefs = [t for t in _operational_tables_]
@@ -931,7 +940,7 @@ class Database:
         s._insert_model_metadata(model, rowid)
 
         # update the timeline view with the new model
-        _create_timeline_view(s)
+        _create_timeline_view(s, s._excluded_from_timeline)
 
         # end transaction if we started it
         if started_transaction is True:
@@ -1054,7 +1063,7 @@ class Database:
         s.dbcur.execute(q, (modelname,))
         droplist = [r[0] for r in s.dbcur if r[0] is not None]
         for tbl in droplist:
-            q = 'DELETE FROM '+MAPTBLNAME+' WHERE maptable_ == ?'
+            q = 'DELETE FROM '+PROPTBLNAME+' WHERE proptable_ == ?'
             s.dbcur.execute(q, (tbl,))
             s._drop_table(tbl)
 
@@ -1073,7 +1082,7 @@ class Database:
         discard = s.models.pop(modelname)
 
         # re-create the timeline view
-        _create_timeline_view(s)
+        _create_timeline_view(s, s._excluded_from_timeline)
 
         if started_transaction is True:
             s.dbcur.execute('COMMIT')
@@ -1180,7 +1189,7 @@ class Database:
         # update the model descriptors by reloading database
         s.reload_db()
         # and re-create the timeline view
-        _create_timeline_view(s)
+        _create_timeline_view(s, s._excluded_from_timeline)
 
 
     def unhide_column_from_previews(s, fieldname, modelname=None):
@@ -1196,7 +1205,7 @@ class Database:
         # update model descriptors by reloading database
         s.reload_db()
         # and re-create the timeline view
-        _create_timeline_view(s)
+        _create_timeline_view(s, s._excluded_from_timeline)
 
 
     def modelitem(s, modelname, itemnr):
@@ -1297,6 +1306,66 @@ class Database:
                 yield s.modelitem(modelname, r[0])
 
 
+    def total_modelitems(s, modelname):
+        ''' return the total number of modelitems for given model '''
+
+        if modelname not in s.models:
+            raise ValueError("model {:} does not exist")
+
+        m = s.models[modelname]
+        tbl = m.tabledef.name
+        q = 'SELECT count(*) FROM {:}'.format(tbl)
+        c = s.dbcon.cursor()
+        c.execute(q)
+        r = c.fetchall()
+        return r[0][0]
+
+
+    def max_field_value(s, modelname, fieldname):
+        ''' return the max value stored in the given field in the given model '''
+
+        tbl, col = s._get_col_and_tbl(modelname, fieldname)
+        if col is None:
+            raise ValueError('field {:} has no direct column, unable to determine max value')
+        q = 'SELECT max({:}) FROM {:}'.format(col, tbl)
+        c = s.dbcon.cursor()
+        c.execute(q)
+        r = c.fetchall()
+        return r[0][0]
+
+
+    def min_field_value(s, modelname, fieldname):
+        ''' return the max value stored in the given field in the given model '''
+
+        tbl, col = s._get_col_and_tbl(modelname, fieldname)
+        if col is None:
+            raise ValueError('field {:} has no direct column, unable to determine min value')
+        q = 'SELECT min({:}) FROM {:}'.format(col, tbl)
+        c = s.dbcon.cursor()
+        c.execute(q)
+        r = c.fetchall()
+        return r[0][0]
+
+
+    def _get_col_and_tbl(s, modelname, fieldname):
+        ''' get the table and column name for given fieldname in given model
+        '''
+
+        if modelname not in s.models:
+            raise ValueError("model {:} does not exist")
+
+        m = s.models[modelname]
+        tbl = m.tabledef.name
+
+        if fieldname not in m.fielddescriptors:
+            raise ValueError("field {:} is not a field of this model")
+        cdef = m.fielddescriptors[fieldname].columndef
+        if cdef is None:
+            return tbl, None
+        else:
+            return tbl, cdef.name
+
+
     def get_tblname(s, model):
         ''' return the tablename for the given model '''
         return s.models[model].tabledef.name
@@ -1343,7 +1412,77 @@ class Database:
             yield _nt('maptable_names', 'table leftid rightid element_index')(n, l , r, i)
 
 
-    def timeline(s, tstart=None, tend=None):
+    def exclude_from_timeline(s, modelname):
+        ''' remove items from given model from the timeline view '''
+
+        if isinstance(modelname, str) and modelname in s.models:
+            if modelname in s._excluded_from_timeline:
+                return
+            else:
+                s._excluded_from_timeline.append(modelname)
+
+        else:
+            raise ValueError('invalid modelname given')
+
+        # update the reserved table
+        q = '''UPDATE {:s} SET timeline_blacklist="{:}"'''
+        q = q.format(_reserved_.name, repr(s._excluded_from_timeline))
+        s.dbcur.execute(q)
+
+        _create_timeline_view(s, s._excluded_from_timeline)
+
+
+    def include_in_timeline(s, modelname):
+        ''' re-add excluded items from given model to the timeline view '''
+
+        if isinstance(modelname, str) and modelname in s.models:
+            if modelname not in s._excluded_from_timeline:
+                return
+            else:
+                s._excluded_from_timeline.remove(modelname)
+        else:
+            raise ValueError('invalid modelname given')
+
+        # update the reserved table
+        q = '''UPDATE {:s} SET timeline_blacklist="{:}"'''
+        q = q.format(_reserved_.name, repr(s._excluded_from_timeline))
+        s.dbcur.execute(q)
+
+        _create_timeline_view(s, s._excluded_from_timeline)
+
+
+    def timeline_summary(s, tstart=None, tend=None):
+        ''' generate summary tuples for modelitems in the timeline '''
+
+        tpl = _nt('timeline_item', 'model field min max count')
+
+        if isinstance(tstart, _datetime):
+            tstart = _isoformat(tstart)
+        if isinstance(tend, _datetime):
+            tend = _isoformat(tend)
+
+        tfields = [(t.modelname_, t.fieldname_, t.modeltable_, t.columnname_) for t in _timeline_fields(s)]
+
+        for mname,fn,tbl,col in tfields:
+            q = "SELECT min(timestamp_),max(timestamp_), count(timestamp_)" +\
+                    "FROM xTimeline_ " +\
+                    "WHERE table_=='{:}' AND timestampfield_=='{:}'"
+            q = q.format(tbl, col)
+
+            if isinstance(tstart, str):
+                q+= ' AND timestamp_ >= "{:s}"'.format(tstart)
+
+            if isinstance(tend, str):
+                q+= ' AND timestamp_ <= "{:s}"'.format(tend)
+
+            c = s.dbcon.cursor()
+            c.execute(q)
+            r = c.fetchall()
+            if r[0][2] != 0:
+                yield tpl(mname, fn, *r[0])
+
+
+    def timeline(s, tstart=None, tend=None, modelitem=False):
         ''' generate a sequence of modelitems in timeline order
 
         The timeline is optionally limited by the given tstart and/or tend
@@ -1354,7 +1493,7 @@ class Database:
         if isinstance(tend, _datetime):
             tend = _isoformat(tend)
 
-        q = 'SELECT timestamp_, table_, {:s}id FROM {:s}Timeline_'.format(s.prefix, s.prefix)
+        q = 'SELECT timestamp_, timestampfield_, table_, preview_, {:s}id FROM {:s}Timeline_'.format(s.prefix, s.prefix)
 
         if isinstance(tstart, str):
             q+= ' WHERE timestamp_ >= "{:s}"'.format(tstart)
@@ -1372,16 +1511,31 @@ class Database:
         g = cursor.execute(q)
 
         tablecache = {}
+        fieldcache = {}
 
-        for tstamp, table, rowid in g:
-            if table in tablecache:
-                yield tstamp, s.modelitem(tablecache[table], rowid)
+        for tstamp, column, table, preview, rowid in g:
+            if table in tablecache and (table, column) in fieldcache:
+                mname = tablecache[table]
+                fname = fieldcache[(table, column)]
+                if modelitem is True:
+                    yield tstamp, mname, rowid, fname, preview, s.modelitem(mname, rowid)
+                else:
+                    yield tstamp, mname, rowid, fname, preview
             else:
                 for m in s.models.values():
                     if m.tabledef.name == table:
                         tablecache[table] = m.name
                         break
-                yield tstamp, s.modelitem(m.name, rowid)
+                for fname, fd in m.fielddescriptors.items():
+                    if fd.columndef is None:
+                        continue
+                    elif fd.columndef.name == column:
+                        fieldcache[(table, column)] = fname
+                        break
+                if modelitem is True:
+                    yield tstamp, m.name, rowid, fname, preview, s.modelitem(m.name, rowid)
+                else:
+                    yield tstamp, m.name, rowid, fname, preview
 
 
     def _has_model(s, model):
@@ -1552,7 +1706,7 @@ class Database:
             fdefs.append(fdef)
 
         # create the model
-        mdef = _model_definition(name, fdefs, 
+        mdef = _model_definition(name, fdefs,
                                  model_record.source_, model_record.version_,
                                  bool(model_record.explicit_dedup_),
                                  bool(model_record.implicit_dedup_),

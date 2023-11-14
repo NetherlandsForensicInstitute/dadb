@@ -576,7 +576,7 @@ class Model:
             raise ValueError('not all fields accounted for')
 
 
-    def _mapper(s, dbcon, itemnr, fieldname):
+    def _mapper(s, dbcon, itemnr, fieldname, with_pkey=False):
         ''' helper function that deals with the mappings for mapped models '''
 
 
@@ -612,7 +612,10 @@ class Model:
         # call to next()
         for element_index in sorted(yieldorder.keys()):
             mtype, mid = yieldorder[element_index]
-            yield s.submodels[mtype].getter(dbcon, mid)
+            if with_pkey is True:
+                yield (mid, s.submodels[mtype].getter(dbcon, mid))
+            else:
+                yield s.submodels[mtype].getter(dbcon, mid)
 
 
     def _insert_direct_fields(s, dbcon, modelitem):
@@ -636,49 +639,13 @@ class Model:
                 else:
                     raise ValueError("value None given in non-nullable field '{:s}'".format(fname))
 
-            # 1) value is an Enum
-            elif fname in s._enum_fields:
-                # make sure datatype of provided value is correct
-                if not _equivalent_datatype(type(fval), s._enum_fields[fname].subenum):
-                    msg = 'Expected type {:} in field {:}, got {:}'
-                    msg = msg.format(s._enum_fields[fname].subenum, fname, type(fval))
-                    raise ValueError(msg)
-                # add the integer value to the record
-                direct_values.append(fval.value)
-
-            # 2) value is a submodel item
-            elif fname in s._submodel_fields:
-
-                # get the model name
-                submodel_name = s._submodel_fields[fname].submodel.__name__
-
-                # 2a) rowid was provided
-                if isinstance(fval, int):
-                    # check if modelitem with that id exists
-                    # NOTE: this could be something to disable when the caller
-                    #       knows that it uses recently inserted submodelitems.
-                    #       For now, no premature optimization.
-                    try:
-                        s.submodels[submodel_name].getter(dbcon, fval)
-                    except _NoSuchModelItemError:
-                        msg = "no modelitem of type {:} exists with id {:} for field {:}"
-                        msg = msg.format(submodel_name, fval, fname)
-                        raise _NoSuchModelItemError(msg)
-                    # add the rowid to the record
-                    direct_values.append(fval)
-
-                # 2b) submodelitem provided (inserter will check datatype)
-                else:
-                    # insert the submodel item (nested=True, implicit insert)
-                    rowid = s.submodels[submodel_name].inserter(dbcon, fval, True)
-                    direct_values.append(rowid)
-
-            # 3) normal field with a basic datatype value
+            # 1) normal field with a basic datatype value
             elif fname in s._normal_fields:
 
                 # we do not accept any sequences or generator types
-                if type(fval) in (tuple, _types.GeneratorType):
-                    raise ValueError('value provided in field {:s} may not be a sequence'.format(fname))
+                # Disabled this check, this is already checked in _equivalent_datatype
+                #if type(fval) in (tuple, _types.GeneratorType):
+                #    raise ValueError('value provided in field {:s} may not be a sequence'.format(fname))
 
                 # this field contains a simple value, store by using
                 # the appropriate converter for the type at hand
@@ -707,6 +674,32 @@ class Model:
                 # not inserted, making a single modelitem insert atomic.
                 sval = s._field_converters[fname](fval)
                 direct_values.append(sval)
+
+            # 2) value is an Enum
+            elif fname in s._enum_fields:
+                # make sure datatype of provided value is correct
+                if not _equivalent_datatype(type(fval), s._enum_fields[fname].subenum):
+                    msg = 'Expected type {:} in field {:}, got {:}'
+                    msg = msg.format(s._enum_fields[fname].subenum, fname, type(fval))
+                    raise ValueError(msg)
+                # add the integer value to the record
+                direct_values.append(fval.value)
+
+            # 3) value is a submodel item
+            elif fname in s._submodel_fields:
+
+                # 3a) A rowid was provided, in which case we assume that
+                #     the caller knows what he is doing and we do not check if
+                #     the modelitem actually exists.
+                if isinstance(fval, int):
+                    direct_values.append(fval)
+
+                # 3b) submodelitem provided (inserter will check datatype)
+                else:
+                    # insert the submodel item (nested=True, implicit insert)
+                    submodel_name = s._submodel_fields[fname].submodel.__name__
+                    rowid = s.submodels[submodel_name].inserter(dbcon, fval, True)
+                    direct_values.append(rowid)
 
         # now that all direct fields are resolved, we can insert the modelitem.
         cursor = dbcon.cursor()
@@ -833,19 +826,10 @@ class Model:
                         msg = "attempt to mix numeric and full modelitem inserts in field {:s}"
                         raise ValueError(msg.format(fname))
                     # if we get here, this is an allowed numeric_insert
-                    try:
-                        # check if the item with given objectID exists
-                        # NOTE: here too, we could disable this check if the
-                        #       caller knows that the objectIDs are indeed
-                        #       present, because they where just inserted by
-                        #       the same caller. For now leave this extra
-                        #       check in place.
-                        s.submodels[expected_modeltype_name].getter(dbcon, subval)
-                    except _NoSuchModelItemError:
-                        msg = "no modelitem of type {:} exists with id {:} for field {:}"
-                        msg = msg.format(expected_modeltype_name, subval, fname)
-                        raise _NoSuchModelItemError(msg)
-                    # the id is valid, insert the maptable entry
+                    # and we assume that the caller makes sure that the number
+                    # is an actual rowid of an existing modelitem. No
+                    # additional checking is done, since that defeats the
+                    # purpose of allowing numerical inserts as optimization
                     cursor.execute(insert_query, (rowid, subval, element_index))
 
                 # 2) Modelitem value
