@@ -15,7 +15,7 @@ setup(
     description="Data Analysis DataBase",
     url='https://github.com/NetherlandsForensicInstitute/dadb',
     long_description=readme+"\n\n",
-    packages=['dadb'],
+    packages=['dadb','dadb.models'],
     classifiers=[
         'License :: OSI Approved :: MIT License',
         'Development Status :: 4 - Beta',
@@ -28,7 +28,10 @@ setup(
     install_requires=[
         'tqdm',
         'python-dateutil',
-        'apsw'
+        'apsw',
+        'pytz',
+        'python-magic',
+        'libarchive-c'
     ],
     zip_safe=False,
     package_data={
