@@ -22,3 +22,24 @@ from ._data import Data
 from ._model_definition import model_definition
 from ._model_definition import field_definition
 from . import _exceptions as exceptions
+
+# built-in models
+from .models import filemodel
+from .models import fileparentmodel
+from .models import filesetmodel
+from .models import libmagicmodel
+from .models import archivemodel
+from .models import decompressmodel
+from .models import stringsmodel
+
+
+def register_all_models(db):
+    ''' register all available models with the given database '''
+
+    filemodel.register_with_db(db)
+    fileparentmodel.register_with_db(db)
+    filesetmodel.register_with_db(db)
+    libmagicmodel.register_with_db(db)
+    archivemodel.register_with_db(db)
+    decompressmodel.register_with_db(db)
+    stringsmodel.register_with_db(db)
