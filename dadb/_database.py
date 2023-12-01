@@ -1117,7 +1117,7 @@ class Database:
         return mclass(*values)
 
 
-    def insert_modelitem(s, modelitem, cursor=None, nested=False):
+    def insert_modelitem(s, modelitem, nested=False):
         ''' inserts a single modelitem (and its subitems) into the appropriate
         table(s). If the modelitem is an integer, it is assumed to be the rowid
         of an already existing modelitem. In this case, the rowid is returned
@@ -1449,6 +1449,18 @@ class Database:
         s.dbcur.execute(q)
 
         _create_timeline_view(s, s._excluded_from_timeline)
+
+
+    def disable_duplicate_checking(s, modelname):
+        ''' disable duplicate checking for given model (not persistent!) '''
+
+        s.models[modelname].allow_duplicate_inserts()
+
+
+    def enable_duplicate_checking(s, modelname):
+        ''' enable duplicate checking for given model (not persistent!) '''
+
+        s.models[modelname].deny_duplicate_inserts()
 
 
     def timeline_summary(s, tstart=None, tend=None):
@@ -1829,3 +1841,10 @@ class Database:
 
         if started_transaction is True:
             s.dbcur.execute('COMMIT')
+
+
+    def check_registered(s, modelname):
+        ''' raise a NoSuchModelError when model is not yet registered '''
+
+        if modelname not in s.models:
+            raise _exceptions.NoSuchModelError("{:s} is not yet registered".format(modelname))
