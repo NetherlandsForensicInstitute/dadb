@@ -88,6 +88,13 @@ class Model:
         # NOTE: _normal_fields includes the _data_fields !!
         s._normal_fields = {k:v for k,v in s.fielddescriptors.items() if v.datatype != None}
 
+        # select the proper insert_direct_fields function depending on whether
+        # the model has enums and submodel fields or not (performance measure)
+        if len(s._enum_fields) == 0 and len(s._submodel_fields) == 0:
+            s._insert_direct_fields = s._simple_insert_direct_fields
+        else:
+            s._insert_direct_fields = s._complex_insert_direct_fields
+
         # Prepare the query for the direct fields in the model (i.e. those fields that do
         # not require a property or mapping table and are stored directly in the model table, which
         # includes the enum and submodel fields, since these contain an integer pointing to the proper
@@ -210,6 +217,23 @@ class Model:
         if len(s._mapped_model_queries) != 0:
             s._subinserters.append(s._insert_mapped_model_fields)
 
+        # some ordered lists for speedup of insert_direct_field function
+        s._direct_datatypes=[]
+        s._direct_classes=[]
+        s._direct_nullable=[]
+        s._direct_converters=[]
+        for idx, fname in enumerate(s._direct_fields):
+            s._direct_nullable.append(s.fielddescriptors[fname].nullable)
+            if fname in s._normal_fields:
+                dtname = s._normal_fields[fname].datatype
+                s._direct_datatypes.append(dtname)
+                s._direct_classes.append(s.datatypes[dtname].class_)
+                s._direct_converters.append(s._field_converters[fname])
+            else:
+                s._direct_datatypes.append(None)
+                s._direct_classes.append(None)
+                s._direct_converters.append(None)
+
 
     def identifier(s, dbcon, modelitem):
         ''' returns the id of the given modelitem if it exists '''
@@ -230,10 +254,12 @@ class Model:
                     qvals.append(subitem)
                 else:
                     # 1c) full submodel item provided, use identifier to get id
-                    subid = s.submodels[type(subitem).__name__].identifier(dbcon, subitem)
-                    if subid == None:
+                    try:
+                        subid = s.submodels[type(subitem).__name__].identifier(dbcon, subitem)
+                    except _NoSuchModelItemError:
                         # the provided submodel item does not exist, no match!
-                        return None
+                        msg = "provided {:s} modelitem does not exist".format(s.name)
+                        raise _NoSuchModelItemError(msg)
                     qvals.append(subid)
 
             elif fieldname in s._enum_fields:
@@ -260,7 +286,8 @@ class Model:
                 return r[0]
             except StopIteration:
                 # no results, so no match!
-                return None
+                msg = "provided {:s} modelitem does not exist".format(s.name)
+                raise _NoSuchModelItemError(msg)
 
         # if we get here, we have at least one record that mathes on the direct
         # query fields, but we also have at least one indirect_field, so we have
@@ -318,7 +345,8 @@ class Model:
                 return id_
 
         # if we get here, we have exhausted all direct field matches without finding full match
-        return None
+        msg = "provided {:s} modelitem does not exist".format(s.name)
+        raise _NoSuchModelItemError(msg)
 
 
     def inserter(s, dbcon, modelitem, nested=False):
@@ -618,7 +646,7 @@ class Model:
                 yield s.submodels[mtype].getter(dbcon, mid)
 
 
-    def _insert_direct_fields(s, dbcon, modelitem):
+    def _complex_insert_direct_fields(s, dbcon, modelitem):
         ''' collect and insert the direct fields for given modelitem, returning rowid '''
 
         # list to hold the direct_field values in proper order
@@ -626,57 +654,19 @@ class Model:
 
         # iterate over each of the direct_fields and handle each value
         # according to the datatype of the field.
-        for fname in s._direct_fields:
+        for idx, fname in enumerate(s._direct_fields):
 
-            # get the value in the given field
             fval = getattr(modelitem, fname)
 
             # 0) value NONE is provided (NULL)
             if fval is None:
-                if s.fielddescriptors[fname].nullable is True:
-                    # add None to the record, which will be a NULL value in the database
-                    direct_values.append(None)
-                else:
+                if s._direct_nullable[idx] is False:
                     raise ValueError("value None given in non-nullable field '{:s}'".format(fname))
+                direct_values.append(None)
+                continue
 
-            # 1) normal field with a basic datatype value
-            elif fname in s._normal_fields:
-
-                # we do not accept any sequences or generator types
-                # Disabled this check, this is already checked in _equivalent_datatype
-                #if type(fval) in (tuple, _types.GeneratorType):
-                #    raise ValueError('value provided in field {:s} may not be a sequence'.format(fname))
-
-                # this field contains a simple value, store by using
-                # the appropriate converter for the type at hand
-                datatype_name = s._normal_fields[fname].datatype
-
-                # make sure datatype of provided value matches modeldescriptor
-                if not _equivalent_datatype(type(fval), s.datatypes[datatype_name].class_):
-
-                    # allow IOBase and mmap objects in Data fields
-                    if isinstance(fval, _IOBase) and datatype_name == 'Data':
-                        pass
-                    elif isinstance(fval, _mmap) and datatype_name == 'Data':
-                        pass
-                    else:
-                        msg = 'datatype {:} of provided value for field {:s} does not match required type {:s}'
-                        msg = msg.format(type(fval), fname, datatype_name)
-                        raise ValueError(msg)
-
-                # provided value has proper datatype, convert to storage class
-                # and add to values NOTE: the convert function of the 'Data'
-                # datatype already inserts the data into the database and
-                # returns the rowid of the data object, which is then added to
-                # the list of direct fields. Because we use the same database
-                # connection, all the required inserts are part of the same
-                # transaction, so if some other field fails, the data is also
-                # not inserted, making a single modelitem insert atomic.
-                sval = s._field_converters[fname](fval)
-                direct_values.append(sval)
-
-            # 2) value is an Enum
-            elif fname in s._enum_fields:
+            # 1) value is an Enum
+            if fname in s._enum_fields:
                 # make sure datatype of provided value is correct
                 if not _equivalent_datatype(type(fval), s._enum_fields[fname].subenum):
                     msg = 'Expected type {:} in field {:}, got {:}'
@@ -684,22 +674,93 @@ class Model:
                     raise ValueError(msg)
                 # add the integer value to the record
                 direct_values.append(fval.value)
+                continue
 
-            # 3) value is a submodel item
-            elif fname in s._submodel_fields:
+            # 2) value is a submodel item
+            if fname in s._submodel_fields:
 
-                # 3a) A rowid was provided, in which case we assume that
+                # 2a) A rowid was provided, in which case we assume that
                 #     the caller knows what he is doing and we do not check if
                 #     the modelitem actually exists.
                 if isinstance(fval, int):
                     direct_values.append(fval)
 
-                # 3b) submodelitem provided (inserter will check datatype)
+                # 2b) submodelitem provided (inserter will check datatype)
                 else:
                     # insert the submodel item (nested=True, implicit insert)
                     submodel_name = s._submodel_fields[fname].submodel.__name__
                     rowid = s.submodels[submodel_name].inserter(dbcon, fval, True)
                     direct_values.append(rowid)
+                continue
+
+            # 3) if we get here: normal field with a basic datatype value
+
+            # this field contains a simple value, store by using
+            # the appropriate converter for the type at hand
+            class_name = s._direct_classes[idx]
+
+            # make sure datatype of provided value matches modeldescriptor
+            if not _equivalent_datatype(type(fval), class_name):
+
+                # allow IOBase and mmap objects in Data fields
+                if isinstance(fval, _IOBase) and s._direct_datatypes[idx] == 'Data':
+                    pass
+                elif isinstance(fval, _mmap) and s._direct_datatypes[idx] == 'Data':
+                    pass
+                else:
+                    msg = 'datatype {:} of provided value for field {:s} does not match required type {:s}'
+                    msg = msg.format(type(fval), fname, s._direct_datatypes[idx])
+                    raise ValueError(msg)
+
+            # provided value has proper datatype, convert to storage class
+            # and add to values NOTE: the convert function of the 'Data'
+            # datatype already inserts the data into the database and
+            # returns the rowid of the data object, which is then added to
+            # the list of direct fields. Because we use the same database
+            # connection, all the required inserts are part of the same
+            # transaction, so if some other field fails, the data is also
+            # not inserted, making a single modelitem insert atomic.
+            sval = s._direct_converters[idx](fval)
+            direct_values.append(sval)
+
+        # now that all direct fields are resolved, we can insert the modelitem.
+        cursor = dbcon.cursor()
+        cursor.execute(s._insert_query, tuple(direct_values))
+        rowid = dbcon.last_insert_rowid()
+        return rowid
+
+
+    def _simple_insert_direct_fields(s, dbcon, modelitem):
+        ''' simplified insert_direct_fields function for models without enums
+        and submodel items '''
+
+        # list to hold the direct_field values in proper order
+        direct_values = []
+
+        # iterate over each of the direct_fields and handle each value
+        # according to the datatype of the field.
+        for idx, fname in enumerate(s._direct_fields):
+
+            fval = getattr(modelitem, fname)
+
+            # 0) value NONE is provided (NULL)
+            if fval is None:
+                if s._direct_nullable[idx] is False:
+                    raise ValueError("value None given in non-nullable field '{:s}'".format(fname))
+                direct_values.append(None)
+                continue
+
+            # 1) if we get here: normal field with a basic datatype value
+
+            # convert to storage class and add to values NOTE: the convert
+            # function of the 'Data' datatype already inserts the data into the
+            # database and returns the rowid of the data object, which is then
+            # added to the list of direct fields. Because we use the same
+            # database connection, all the required inserts are part of the
+            # same transaction, so if some other field fails, the data is also
+            # not inserted, making a single modelitem insert atomic.
+            sval = s._direct_converters[idx](fval)
+            direct_values.append(sval)
 
         # now that all direct fields are resolved, we can insert the modelitem.
         cursor = dbcon.cursor()
@@ -873,18 +934,18 @@ class Model:
                 return None
             if s.explicit_dedup is True:
                 # deduplicate
-                existing = s.identifier(dbcon, modelitem)
-                if existing is not None:
+                try:
+                    existing = s.identifier(dbcon, modelitem)
                     return existing
-                else:
+                except _NoSuchModelItemError:
                     return None
             # we never get here if explicit_dedup is True
             if s.fail_on_dup is True:
                 # fail on duplicate
-                existing = s.identifier(dbcon, modelitem)
-                if existing is not None:
+                try:
+                    existing = s.identifier(dbcon, modelitem)
                     raise _ExplicitDuplicateError(exp_msg.format(existing))
-                else:
+                except _NoSuchModelItemError:
                     return None
             else:
                 raise RuntimeError('this should not happen!')
@@ -896,18 +957,18 @@ class Model:
             return None
         elif s.implicit_dedup is True:
             # deduplicate
-            existing = s.identifier(dbcon, modelitem)
-            if existing is not None:
+            try:
+                existing = s.identifier(dbcon, modelitem)
                 return existing
-            else:
+            except _NoSuchModelItemError:
                 return None
         # we never get here if implicit_dedup is True
         elif s.fail_on_dup is True:
             # fail on duplicate
-            existing = s.identifier(dbcon, modelitem)
-            if existing is not None:
+            try:
+                existing = s.identifier(dbcon, modelitem)
                 raise _ImplicitDuplicateError(imp_msg.format(existing))
-            else:
+            except _NoSuchModelItemError:
                 return None
 
         raise RuntimeError('we should not get here!')
