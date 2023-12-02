@@ -973,7 +973,7 @@ def _parse_extra(data):
     # default values
     mtime, atime, ctime, btime = None, None, None, None
     uid, gid, inode, device = None, None, None, None
-    gk = False
+    swap_timestamps = False
     extra_time = None
 
     # scan over the data in order to find extra field magics
@@ -1040,11 +1040,12 @@ def _parse_extra(data):
                 if uidsize == 4:
                     gid = _unpack("<I", field[7:11])[0]
 
-        elif magic == 0x4b47:  # GK
-            gk = True
-            version = field[0]
-            if version != 1:
-                raise ValueError("expected GK version = 1")
+        elif magic == 0x4b47:
+            # observed in some zip files, not 100% sure
+            swap_timestamps = True
+            field0 = field[0]
+            if field0 != 1:
+                raise ValueError("only observed 1 here")
 
         else:
             # ignore other blocks silently. Note that we may miss some
@@ -1053,8 +1054,8 @@ def _parse_extra(data):
             # raise ValueError("unsupported extra block encountered: {:}".format(magic))
             pass
 
-    # In this case, the timestamps order of the timestamps is different
-    if gk is True:
+    if swap_timestamps is True:
+        # In this case, the order of the timestamps seems different
         ctime = btime
         btime = extra_time
 
