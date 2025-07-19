@@ -81,4 +81,5 @@ Run the following from the checked-out repository:
 
 ## License
 
-Copyright (C) 2023-2025 Netherlands Forensic Institute - MIT License
+Copyright (c) 2023-2025 Netherlands Forensic Institute - MIT License
+Copyright (c) 2024-2025 mxkrt@lsjam.nl - MIT License
